@@ -162,25 +162,44 @@ def transform(im: Image.Image, scrub: float = 0.0,
     return img
 
 
+def save_image(img: Image.Image, fp, ext: str, quality: int) -> None:
+    """Сохраняет изображение в путь или файловый объект. Метаданные не пишем."""
+    ext = ext.lower()
+    if ext in (".jpg", ".jpeg"):
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        img.save(fp, "JPEG", quality=quality, optimize=True, progressive=True)
+    elif ext == ".webp":
+        img.save(fp, "WEBP", quality=quality, method=6)
+    elif ext == ".png":
+        img.save(fp, "PNG", optimize=True)
+    else:
+        img.save(fp, "PNG")   # неизвестное расширение -> безопасный PNG
+
+
 def process(src: Path, dst: Path, quality: int, scrub: float,
             dct: float = 0.0) -> None:
     with Image.open(src) as im:
         im.load()
         img = transform(im, scrub=scrub, dct=dct)
-
         dst.parent.mkdir(parents=True, exist_ok=True)
-        ext = dst.suffix.lower()
-        if ext in (".jpg", ".jpeg"):
-            if img.mode in ("RGBA", "P", "LA"):
-                img = img.convert("RGB")
-            img.save(dst, "JPEG", quality=quality, optimize=True,
-                     progressive=True)
-        elif ext == ".webp":
-            img.save(dst, "WEBP", quality=quality, method=6)
-        elif ext == ".png":
-            img.save(dst, "PNG", optimize=True)
-        else:
-            img.save(dst)   # exif/icc не передаём -> метаданных нет
+        save_image(img, dst, dst.suffix, quality)
+
+
+def clean_bytes(data: bytes, filename: str, quality: int = 92,
+                scrub: float = 0.0, dct: float = 0.0):
+    """Очищает изображение из байтов, возвращает (bytes, имя_файла).
+    Используется телеграм-ботом. Единый пайплайн с CLI/GUI."""
+    import io
+    ext = Path(filename).suffix.lower()
+    if ext not in SUPPORTED:
+        ext = ".jpg"
+    with Image.open(io.BytesIO(data)) as im:
+        im.load()
+        img = transform(im, scrub=scrub, dct=dct)
+    buf = io.BytesIO()
+    save_image(img, buf, ext, quality)
+    return buf.getvalue(), Path(filename).stem + "_clean" + ext
 
 
 def collect(inp: Path, recursive: bool):
