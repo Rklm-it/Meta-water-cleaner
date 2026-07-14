@@ -18,9 +18,10 @@ curl -fsSL https://get.docker.com | sh
 git clone https://github.com/Rklm-it/Meta-water-cleaner.git
 cd Meta-water-cleaner
 
-# 3. Прописать токен
+# 3. Прописать токен и (желательно) белый список
 cp .env.example .env
-nano .env            # вписать BOT_TOKEN=твой_токен
+nano .env            # BOT_TOKEN=твой_токен ; ALLOWED_USERS=твой_id
+                     # свой id узнаешь, написав боту /id после старта
 
 # 4. Запустить (соберётся образ и стартует в фоне)
 docker compose up -d --build
@@ -36,7 +37,9 @@ docker compose up -d --build   # обновить после git pull
 ```
 
 `restart: unless-stopped` в `docker-compose.yml` поднимет бота после
-перезагрузки сервера автоматически.
+перезагрузки сервера автоматически. Настройки пользователей и статистика
+лежат в томе `./data` (переживают пересборку). В образе есть healthcheck —
+`docker compose ps` покажет статус `healthy`, если бот жив.
 
 ---
 

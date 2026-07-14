@@ -48,8 +48,6 @@ def scrub_pixels(img: Image.Image, strength: float) -> Image.Image:
     Снижает шанс выживания невидимых водяных знаков. Портит качество.
     strength: 0.0..1.0 (насколько агрессивно).
     """
-    import random
-
     w, h = img.size
     factor = 1.0 - 0.15 * strength           # уменьшаем до 15%
     small = img.resize((max(1, int(w * factor)), max(1, int(h * factor))),
@@ -58,27 +56,20 @@ def scrub_pixels(img: Image.Image, strength: float) -> Image.Image:
 
     img = img.filter(ImageFilter.GaussianBlur(radius=0.4 * strength))
 
-    if img.mode not in ("RGB", "RGBA", "L"):
+    if img.mode not in ("RGB", "RGBA", "L", "LA"):
         img = img.convert("RGB")
-    px = img.load()
     amp = int(6 * strength)                  # амплитуда шума
     if amp > 0:
-        rnd = random.Random(1234)
-        bands = len(img.getbands())
-        for y in range(h):
-            for x in range(w):
-                cur = px[x, y]
-                if bands == 1:
-                    px[x, y] = _clamp(cur + rnd.randint(-amp, amp))
-                else:
-                    px[x, y] = tuple(
-                        _clamp(c + rnd.randint(-amp, amp)) for c in cur
-                    )
+        import numpy as np
+        rng = np.random.default_rng(1234)
+        bands = img.getbands()
+        arr = np.asarray(img).astype(np.int16)
+        noise = rng.integers(-amp, amp + 1, size=arr.shape, dtype=np.int16)
+        if arr.ndim == 3 and "A" in bands:   # альфу не трогаем
+            noise[..., bands.index("A")] = 0
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        img = Image.fromarray(arr, img.mode)
     return img
-
-
-def _clamp(v: int) -> int:
-    return 0 if v < 0 else 255 if v > 255 else v
 
 
 # --- Частотный режим (DCT) -------------------------------------------------
@@ -111,19 +102,21 @@ def _midband_mask(n: int = 8, lo: int = 2, hi: int = 5):
 
 
 def _scrub_channel_dct(ch, strength: float, rng, amp: float = 6.0):
+    """Векторизованное частотное возмущение канала по 8x8 блокам."""
     import numpy as np
     D = _DCT_CACHE.setdefault("D", _dct_matrix(8))
     mask = _DCT_CACHE.setdefault("mask", _midband_mask(8))
     h, w = ch.shape
     ph, pw = (-h) % 8, (-w) % 8
     p = np.pad(ch, ((0, ph), (0, pw)), mode="edge").astype(np.float64)
+    H, W = p.shape
+    # (H,W) -> блоки (nby, nbx, 8, 8)
+    blocks = p.reshape(H // 8, 8, W // 8, 8).transpose(0, 2, 1, 3)
+    coef = D @ blocks @ D.T                          # прямой DCT для всех блоков
     sigma = amp * strength
-    for by in range(0, p.shape[0], 8):
-        for bx in range(0, p.shape[1], 8):
-            b = p[by:by + 8, bx:bx + 8]
-            c = D @ b @ D.T
-            c += rng.normal(0, sigma, (8, 8)) * mask
-            p[by:by + 8, bx:bx + 8] = D.T @ c @ D
+    coef += rng.normal(0, sigma, size=blocks.shape) * mask
+    out = D.T @ coef @ D                             # обратный DCT
+    p = out.transpose(0, 2, 1, 3).reshape(H, W)
     return np.clip(p[:h, :w], 0, 255)
 
 
@@ -186,20 +179,80 @@ def process(src: Path, dst: Path, quality: int, scrub: float,
         save_image(img, dst, dst.suffix, quality)
 
 
+def inspect_metadata(im: Image.Image) -> list:
+    """Возвращает список понятных ярлыков метаданных, найденных в картинке."""
+    labels = []
+    try:
+        ex = im.getexif()
+    except Exception:  # noqa: BLE001
+        ex = {}
+    checks = [
+        (34853, "геолокация (GPS)"),
+        (271, "камера"), (272, "камера"),
+        (306, "дата съёмки"), (36867, "дата съёмки"),
+        (305, "софт"),
+        (315, "автор"), (33432, "копирайт"),
+    ]
+    for tag, label in checks:
+        if tag in ex and label not in labels:
+            labels.append(label)
+    info = getattr(im, "info", {}) or {}
+    if "xmp" in info:
+        labels.append("XMP")
+    if info.get("icc_profile"):
+        labels.append("ICC-профиль")
+    if "photoshop" in info or "iptc" in info:
+        labels.append("IPTC")
+    if "comment" in info:
+        labels.append("комментарий")
+    return labels
+
+
+def fit_within(img: Image.Image, max_side: int) -> Image.Image:
+    """Уменьшает так, чтобы наибольшая сторона <= max_side. Не увеличивает."""
+    if not max_side:
+        return img
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img
+    scale = max_side / float(max(w, h))
+    return img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                      Image.LANCZOS)
+
+
+def _target_ext(filename: str, out_format: str) -> str:
+    """Выбирает расширение выходного файла по настройке формата."""
+    fmt = (out_format or "keep").lower()
+    if fmt in ("jpg", "jpeg"):
+        return ".jpg"
+    if fmt == "webp":
+        return ".webp"
+    if fmt == "png":
+        return ".png"
+    ext = Path(filename).suffix.lower()          # keep
+    return ext if ext in SUPPORTED else ".jpg"
+
+
 def clean_bytes(data: bytes, filename: str, quality: int = 92,
-                scrub: float = 0.0, dct: float = 0.0):
-    """Очищает изображение из байтов, возвращает (bytes, имя_файла).
-    Используется телеграм-ботом. Единый пайплайн с CLI/GUI."""
+                scrub: float = 0.0, dct: float = 0.0,
+                max_side: int = 0, out_format: str = "keep"):
+    """Очищает изображение из байтов.
+    Возвращает (bytes, имя_файла, info) где info содержит:
+      removed  — список удалённых метаданных,
+      size_in / size_out — размер в байтах до/после.
+    Единый пайплайн с CLI/GUI."""
     import io
-    ext = Path(filename).suffix.lower()
-    if ext not in SUPPORTED:
-        ext = ".jpg"
+    ext = _target_ext(filename, out_format)
     with Image.open(io.BytesIO(data)) as im:
         im.load()
+        removed = inspect_metadata(im)
         img = transform(im, scrub=scrub, dct=dct)
+        img = fit_within(img, max_side)
     buf = io.BytesIO()
     save_image(img, buf, ext, quality)
-    return buf.getvalue(), Path(filename).stem + "_clean" + ext
+    out = buf.getvalue()
+    info = {"removed": removed, "size_in": len(data), "size_out": len(out)}
+    return out, Path(filename).stem + "_clean" + ext, info
 
 
 def collect(inp: Path, recursive: bool):

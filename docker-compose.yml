@@ -2,8 +2,12 @@ services:
   bot:
     build: .
     restart: unless-stopped
-    env_file: .env          # здесь лежит BOT_TOKEN=...
-    # логи не раздуваем
+    env_file: .env          # BOT_TOKEN=..., ALLOWED_USERS=...
+    environment:
+      DATA_FILE: /app/data/botdata.pkl   # настройки пользователей
+      STATS_FILE: /app/data/stats.csv    # статистика (по желанию)
+    volumes:
+      - ./data:/app/data                 # сохраняется между пересборками
     logging:
       driver: json-file
       options:
