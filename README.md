@@ -33,9 +33,12 @@
 **Docker (для сервера/VPS, всегда онлайн):**
 
 ```bash
-docker build -t photo-cleaner-bot .
-docker run -e BOT_TOKEN=xxxxx --restart unless-stopped photo-cleaner-bot
+cp .env.example .env      # вписать BOT_TOKEN
+docker compose up -d --build
 ```
+
+Подробная инструкция по развёртыванию на VPS (Docker и systemd) —
+в [DEPLOY.md](DEPLOY.md).
 
 ## Быстрый старт окна (двойной клик, без командной строки)
 

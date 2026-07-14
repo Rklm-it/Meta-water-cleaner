@@ -1,0 +1,16 @@
+[Unit]
+Description=Photo cleaner Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/meta-water-cleaner
+EnvironmentFile=/opt/meta-water-cleaner/.env
+ExecStart=/opt/meta-water-cleaner/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
