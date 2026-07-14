@@ -22,12 +22,13 @@ bot.py — телеграм-бот для чистки фотографий.
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from clean_images import clean_bytes
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      BotCommand)
+                      InputMediaDocument, BotCommand)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
@@ -40,6 +41,12 @@ DEFAULT_MODE = "dct"
 DEFAULT_STRENGTH = 0.6
 STRENGTHS = [0.3, 0.6, 1.0]
 MAX_BYTES = 20 * 1024 * 1024        # лимит скачивания Bot API
+ALBUM_DEBOUNCE = 1.5               # сек ожидания остальных фото из альбома
+
+# Буфер альбомов: media_group_id -> список сообщений
+_album_buf: dict = {}
+_album_last: dict = {}
+_album_lock = asyncio.Lock()
 
 MODE_TITLES = {
     "meta": "Только метаданные",
@@ -51,6 +58,8 @@ HELP = (
     "Пришли мне картинку — верну очищенную копию:\n"
     "• удаляю метаданные (EXIF, GPS, XMP, IPTC, ICC, C2PA);\n"
     "• по желанию подавляю невидимые водяные знаки.\n\n"
+    "📦 Можно *пачкой* — выдели сразу несколько фото (альбом), "
+    "я обработаю все и верну одним альбомом.\n\n"
     "⚠️ Присылай как *ФАЙЛ* (скрепка → Файл), а не как «фото» — иначе "
     "телеграм сожмёт картинку и потеряет часть данных ещё до меня.\n\n"
     "Команды:\n"
@@ -133,53 +142,117 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, reply_markup=_settings_kb(mode, strength))
 
 
-async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+async def _download_and_clean(msg, mode: str, strength: float, idx=None):
+    """Скачивает картинку и возвращает (bytes, имя, было_фото, исходные_байты)."""
     as_photo = bool(msg.photo)
     if as_photo:
         tg_file = await msg.photo[-1].get_file()
-        filename = "photo.jpg"
-    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-        if msg.document.file_size and msg.document.file_size > MAX_BYTES:
-            await msg.reply_text("Файл слишком большой (лимит ~20 МБ).")
-            return
-        tg_file = await msg.document.get_file()
-        filename = msg.document.file_name or "image.jpg"
+        filename = f"photo_{idx}.jpg" if idx is not None else "photo.jpg"
     else:
-        await msg.reply_text(
-            "Пришли изображение (лучше как файл). /help — подробнее.")
-        return
-
-    mode = _get(context, "mode", DEFAULT_MODE)
-    strength = _get(context, "strength", DEFAULT_STRENGTH)
+        doc = msg.document
+        if doc.file_size and doc.file_size > MAX_BYTES:
+            raise ValueError("файл больше ~20 МБ")
+        tg_file = await doc.get_file()
+        filename = doc.file_name or "image.jpg"
     dct = strength if mode == "dct" else 0.0
     scrub = strength if mode == "scrub" else 0.0
+    data = bytes(await tg_file.download_as_bytearray())
+    out, name = await asyncio.to_thread(
+        clean_bytes, data, filename, 92, scrub, dct)
+    return out, name, as_photo, data
 
-    note = await msg.reply_text("Обрабатываю…")
-    try:
-        data = bytes(await tg_file.download_as_bytearray())
-        out, name = await asyncio.to_thread(
-            clean_bytes, data, filename, 92, scrub, dct)
-    except Exception as e:  # noqa: BLE001
-        log.exception("processing failed")
-        await note.edit_text(f"Не получилось обработать: {e}")
-        return
 
-    caption = f"Готово. Режим: {MODE_TITLES.get(mode, mode)}"
+async def _send_results(bot, chat_id, results, summary: str) -> None:
+    """Отправляет очищенные файлы (по одному или альбомами по 10)."""
+    first = True
+    for i in range(0, len(results), 10):
+        chunk = results[i:i + 10]
+        if len(chunk) == 1:
+            out, name = chunk[0]
+            await bot.send_document(chat_id, document=out, filename=name,
+                                    caption=summary if first else None)
+        else:
+            media = [
+                InputMediaDocument(
+                    media=out, filename=name,
+                    caption=summary if (first and j == 0) else None)
+                for j, (out, name) in enumerate(chunk)]
+            await bot.send_media_group(chat_id, media=media)
+        first = False
+
+
+def _summary(mode: str, strength: float, ok: int, total: int,
+             any_photo: bool) -> str:
+    text = (f"Готово: {ok}/{total}. Режим: {MODE_TITLES.get(mode, mode)}"
+            if total > 1 else f"Готово. Режим: {MODE_TITLES.get(mode, mode)}")
     if mode != "meta":
-        caption += f", сила {strength:.1f}"
-        psnr = _psnr(data, out)
-        if psnr is not None:
-            caption += f" · PSNR {psnr:.1f} dB"
-    if as_photo:
-        caption += ("\n⚠️ Это было «фото» — телеграм уже сжал его. "
-                    "Для чистки оригинала присылай как файл.")
+        text += f", сила {strength:.1f}"
+    if ok < total:
+        text += f"\nНе удалось обработать: {total - ok}"
+    if any_photo:
+        text += ("\n⚠️ Часть прислана как «фото» — телеграм их сжал. "
+                 "Для чистки оригиналов присылай файлом.")
+    return text
 
-    await msg.reply_document(document=out, filename=name, caption=caption)
+
+async def _process_batch(context, chat_id, msgs) -> None:
+    mode = _get(context, "mode", DEFAULT_MODE)
+    strength = _get(context, "strength", DEFAULT_STRENGTH)
+    note = await context.bot.send_message(
+        chat_id, f"Обрабатываю {len(msgs)} шт…" if len(msgs) > 1
+        else "Обрабатываю…")
+    results, any_photo, psnr = [], False, None
+    for i, m in enumerate(msgs):
+        try:
+            out, name, as_photo, src = await _download_and_clean(
+                m, mode, strength, idx=i if len(msgs) > 1 else None)
+            results.append((out, name))
+            any_photo = any_photo or as_photo
+            if len(msgs) == 1 and mode != "meta":
+                psnr = _psnr(src, out)
+        except Exception as e:  # noqa: BLE001
+            log.exception("processing failed: %s", e)
+
+    if results:
+        summary = _summary(mode, strength, len(results), len(msgs), any_photo)
+        if psnr is not None:
+            summary += f" · PSNR {psnr:.1f} dB"
+        await _send_results(context.bot, chat_id, results, summary)
+    else:
+        await context.bot.send_message(
+            chat_id, "Не удалось обработать ни одного файла.")
     try:
         await note.delete()
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _flush_album(gid: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ждёт, пока перестанут приходить фото альбома, затем обрабатывает пачкой."""
+    while True:
+        await asyncio.sleep(ALBUM_DEBOUNCE)
+        async with _album_lock:
+            if time.monotonic() - _album_last.get(gid, 0) >= ALBUM_DEBOUNCE:
+                msgs = _album_buf.pop(gid, [])
+                _album_last.pop(gid, None)
+                break
+    if msgs:
+        await _process_batch(context, msgs[0].chat_id, msgs)
+
+
+async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    gid = msg.media_group_id
+    if gid:
+        # часть альбома — копим и обрабатываем группой с задержкой
+        async with _album_lock:
+            is_new = gid not in _album_buf
+            _album_buf.setdefault(gid, []).append(msg)
+            _album_last[gid] = time.monotonic()
+        if is_new:
+            asyncio.create_task(_flush_album(gid, context))
+        return
+    await _process_batch(context, msg.chat_id, [msg])
 
 
 async def _post_init(app: Application) -> None:
