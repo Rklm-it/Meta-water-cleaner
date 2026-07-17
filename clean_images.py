@@ -235,8 +235,12 @@ def _target_ext(filename: str, out_format: str) -> str:
 
 def clean_bytes(data: bytes, filename: str, quality: int = 92,
                 scrub: float = 0.0, dct: float = 0.0,
-                max_side: int = 0, out_format: str = "keep"):
+                max_side: int = 0, out_format: str = "keep",
+                rename: bool = True):
     """Очищает изображение из байтов.
+    rename=True  -> имя вида «оригинал_clean.ext»;
+    rename=False -> сохраняет оригинальное имя (только расширение может
+                    поменяться, если задан другой формат).
     Возвращает (bytes, имя_файла, info) где info содержит:
       removed  — список удалённых метаданных,
       size_in / size_out — размер в байтах до/после.
@@ -252,7 +256,9 @@ def clean_bytes(data: bytes, filename: str, quality: int = 92,
     save_image(img, buf, ext, quality)
     out = buf.getvalue()
     info = {"removed": removed, "size_in": len(data), "size_out": len(out)}
-    return out, Path(filename).stem + "_clean" + ext, info
+    stem = Path(filename).stem
+    name = stem + ("_clean" if rename else "") + ext
+    return out, name, info
 
 
 def collect(inp: Path, recursive: bool):

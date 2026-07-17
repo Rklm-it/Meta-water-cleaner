@@ -45,11 +45,12 @@ log = logging.getLogger("cleaner-bot")
 
 # --- настройки по умолчанию и справочники ---------------------------------
 DEFAULTS = {"mode": "dct", "strength": 0.6, "quality": 92,
-            "max_side": 0, "fmt": "keep"}
+            "max_side": 0, "fmt": "keep", "naming": "suffix"}
 STRENGTHS = [0.3, 0.6, 1.0]
 QUALITIES = [80, 90, 95]
 SIZES = [(0, "Ориг"), (1600, "1600"), (1200, "1200"), (800, "800")]
 FORMATS = [("keep", "Как есть"), ("jpg", "JPG"), ("webp", "WebP"), ("png", "PNG")]
+NAMING = [("suffix", "имя +_clean"), ("original", "оригинал. имя")]
 MODES = [("meta", "Meta"), ("dct", "DCT"), ("scrub", "Scrub"), ("both", "Оба")]
 MODE_TITLES = {"meta": "Только метаданные", "dct": "DCT — аккуратно",
                "scrub": "Scrub — сильно", "both": "DCT+Scrub — максимум"}
@@ -113,7 +114,10 @@ def set_setting(context, key, value) -> None:
 
 def apply_preset(context, name) -> None:
     if name in PRESETS:
-        context.user_data["settings"] = dict(PRESETS[name])
+        cur = context.user_data.get("settings", {})
+        s = dict(PRESETS[name])
+        s["naming"] = cur.get("naming", DEFAULTS["naming"])  # имя не сбрасываем
+        context.user_data["settings"] = s
 
 
 def mode_to_dct_scrub(mode: str, strength: float):
@@ -178,6 +182,9 @@ def settings_kb(s: dict) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton(_mark(s["max_side"] == v) + t,
                              callback_data=f"size:{v}") for v, t in SIZES])
+    rows.append([
+        InlineKeyboardButton(_mark(s["naming"] == n) + t,
+                             callback_data=f"nm:{n}") for n, t in NAMING])
     return InlineKeyboardMarkup(rows)
 
 
@@ -188,6 +195,8 @@ def settings_text(s: dict) -> str:
     parts.append(f"качество {s['quality']}")
     parts.append("формат " + dict(FORMATS).get(s["fmt"], s["fmt"]))
     parts.append("размер " + dict(SIZES).get(s["max_side"], str(s["max_side"])))
+    parts.append("имя: " + ("оригинал" if s["naming"] == "original"
+                            else "+_clean"))
     return "⚙️ Текущие настройки:\n" + ", ".join(parts)
 
 
@@ -271,6 +280,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(context, "fmt", data.split(":", 1)[1])
     elif data.startswith("size:"):
         set_setting(context, "max_side", int(data.split(":", 1)[1]))
+    elif data.startswith("nm:"):
+        set_setting(context, "naming", data.split(":", 1)[1])
     s = get_settings(context)
     try:
         await q.edit_message_text(settings_text(s), reply_markup=settings_kb(s))
@@ -296,7 +307,7 @@ async def _download_and_clean(msg, s: dict, idx=None):
     data = bytes(await tg_file.download_as_bytearray())
     out, name, info = await asyncio.to_thread(
         clean_bytes, data, filename, s["quality"], scrub, dct,
-        s["max_side"], s["fmt"])
+        s["max_side"], s["fmt"], s.get("naming", "suffix") == "suffix")
     return out, name, as_photo, data, info
 
 
