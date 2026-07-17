@@ -25,9 +25,11 @@ bot.py — телеграм-бот для чистки фотографий.
 
 import asyncio
 import csv
+import io
 import logging
 import os
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,12 +47,14 @@ log = logging.getLogger("cleaner-bot")
 
 # --- настройки по умолчанию и справочники ---------------------------------
 DEFAULTS = {"mode": "dct", "strength": 0.6, "quality": 92,
-            "max_side": 0, "fmt": "keep", "naming": "suffix"}
+            "max_side": 0, "fmt": "keep", "naming": "suffix",
+            "delivery": "files"}
 STRENGTHS = [0.3, 0.6, 1.0]
 QUALITIES = [80, 90, 95]
 SIZES = [(0, "Ориг"), (1600, "1600"), (1200, "1200"), (800, "800")]
 FORMATS = [("keep", "Как есть"), ("jpg", "JPG"), ("webp", "WebP"), ("png", "PNG")]
 NAMING = [("suffix", "имя +_clean"), ("original", "оригинал. имя")]
+DELIVERY = [("files", "📄 файлами"), ("zip", "🗂 архивом .zip")]
 MODES = [("meta", "Meta"), ("dct", "DCT"), ("scrub", "Scrub"), ("both", "Оба")]
 MODE_TITLES = {"meta": "Только метаданные", "dct": "DCT — аккуратно",
                "scrub": "Scrub — сильно", "both": "DCT+Scrub — максимум"}
@@ -116,7 +120,9 @@ def apply_preset(context, name) -> None:
     if name in PRESETS:
         cur = context.user_data.get("settings", {})
         s = dict(PRESETS[name])
-        s["naming"] = cur.get("naming", DEFAULTS["naming"])  # имя не сбрасываем
+        # имя и способ выдачи пресетом не сбрасываем
+        s["naming"] = cur.get("naming", DEFAULTS["naming"])
+        s["delivery"] = cur.get("delivery", DEFAULTS["delivery"])
         context.user_data["settings"] = s
 
 
@@ -185,6 +191,9 @@ def settings_kb(s: dict) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton(_mark(s["naming"] == n) + t,
                              callback_data=f"nm:{n}") for n, t in NAMING])
+    rows.append([
+        InlineKeyboardButton(_mark(s["delivery"] == d) + t,
+                             callback_data=f"dl:{d}") for d, t in DELIVERY])
     return InlineKeyboardMarkup(rows)
 
 
@@ -197,6 +206,8 @@ def settings_text(s: dict) -> str:
     parts.append("размер " + dict(SIZES).get(s["max_side"], str(s["max_side"])))
     parts.append("имя: " + ("оригинал" if s["naming"] == "original"
                             else "+_clean"))
+    parts.append("выдача: " + ("архив .zip" if s["delivery"] == "zip"
+                               else "файлами"))
     return "⚙️ Текущие настройки:\n" + ", ".join(parts)
 
 
@@ -282,6 +293,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(context, "max_side", int(data.split(":", 1)[1]))
     elif data.startswith("nm:"):
         set_setting(context, "naming", data.split(":", 1)[1])
+    elif data.startswith("dl:"):
+        set_setting(context, "delivery", data.split(":", 1)[1])
     s = get_settings(context)
     try:
         await q.edit_message_text(settings_text(s), reply_markup=settings_kb(s))
@@ -309,6 +322,25 @@ async def _download_and_clean(msg, s: dict, idx=None):
         clean_bytes, data, filename, s["quality"], scrub, dct,
         s["max_side"], s["fmt"], s.get("naming", "suffix") == "suffix")
     return out, name, as_photo, data, info
+
+
+TG_DOC_LIMIT = 49 * 1024 * 1024     # лимит отправки документа ботом (~50 МБ)
+
+
+def _make_zip(results) -> bytes:
+    """Упаковывает [(bytes, имя)] в один zip. Дубли имён нумерует."""
+    buf = io.BytesIO()
+    used = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for data, name in results:
+            n, i = name, 1
+            while n in used:
+                p = Path(name)
+                n = f"{p.stem}_{i}{p.suffix}"
+                i += 1
+            used.add(n)
+            z.writestr(n, data)
+    return buf.getvalue()
 
 
 async def _send_results(bot, chat_id, results, summary: str) -> None:
@@ -377,7 +409,18 @@ async def _process_batch(context, chat_id, msgs) -> None:
     if results:
         summary = _summary(s, len(results), len(msgs), any_photo, removed,
                            psnrs, size_in, size_out)
-        await _send_results(context.bot, chat_id, results, summary)
+        if s.get("delivery") == "zip" and len(results) > 1:
+            zdata = await asyncio.to_thread(_make_zip, results)
+            if len(zdata) <= TG_DOC_LIMIT:
+                zname = f"cleaned_{datetime.now():%Y%m%d_%H%M}.zip"
+                await context.bot.send_document(
+                    chat_id, document=zdata, filename=zname, caption=summary)
+            else:
+                await context.bot.send_message(
+                    chat_id, "Архив больше 50 МБ — отправляю файлами.")
+                await _send_results(context.bot, chat_id, results, summary)
+        else:
+            await _send_results(context.bot, chat_id, results, summary)
         log_stats(chat_id, len(results), size_in, size_out, s["mode"])
     else:
         await context.bot.send_message(
